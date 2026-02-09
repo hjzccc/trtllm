@@ -27,7 +27,25 @@ import json
 import logging
 import os
 import pathlib
+import sys
 from datetime import datetime, timezone
+
+# ---------------------------------------------------------------------------
+# When running from the TensorRT-LLM source tree the local ``tensorrt_llm/``
+# directory shadows the *installed* package (which contains the compiled C++
+# ``bindings`` extension).  We detect this situation and temporarily patch
+# ``sys.path`` so that ``import tensorrt_llm`` resolves to the installed wheel.
+# ---------------------------------------------------------------------------
+_REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[2])
+if _REPO_ROOT in sys.path:
+    sys.path.remove(_REPO_ROOT)
+    # Also remove '' or '.' which Python adds for CWD — it has the same effect
+    # when CWD == repo root.
+    for _cwd_marker in ("", "."):
+        if _cwd_marker in sys.path and os.path.abspath(
+                _cwd_marker) == _REPO_ROOT:
+            sys.path.remove(_cwd_marker)
+            break
 from typing import Any
 
 import torch
@@ -42,7 +60,7 @@ logger = logging.getLogger("qwen3_moe_bench")
 _PRECISION_SM_CONSTRAINTS: dict[str, tuple[str, Any]] = {
     "bf16": ("min", 80),
     "fp8": ("min", 89),
-    "nvfp4": ("in", {100, 103}),
+    "nvfp4": ("min",100),
 }
 
 
