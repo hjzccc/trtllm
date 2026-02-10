@@ -1,0 +1,9 @@
+{
+  "active_plan": "/home/jerry/Documents/TensorRT-LLM/.sisyphus/plans/qwen3-moe-precision-benchmark.md",
+  "started_at": "2026-02-07T01:56:41.826Z",
+  "session_ids": [
+    "ses_3ca7bbb7cffeyLoR6R6aM5X1bq"
+  ],
+  "plan_name": "qwen3-moe-precision-benchmark",
+  "agent": "atlas"
+}
