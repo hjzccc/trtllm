@@ -31,6 +31,20 @@ import sys
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
+# Disable MPI for single-GPU benchmarks.  This avoids OpenMPI singleton-mode
+# hangs (e.g. ``orted`` colliding with services on port 6006) and removes the
+# hard dependency on a working MPI installation.  TensorRT-LLM falls back to
+# rank=0 / world_size=1 when this variable is set.
+# ---------------------------------------------------------------------------
+os.environ.setdefault("TLLM_DISABLE_MPI", "1")
+# TLLM_DISABLE_MPI is not recognized by TRT-LLM 1.1.0.  The actual
+# variable that forces a single-process worker (bypassing MPI entirely)
+# is TLLM_WORKER_USE_SINGLE_PROCESS.  This avoids the MpiPoolSession
+# code path that fails when running as root (prte refuses without
+# --allow-run-as-root).
+os.environ.setdefault("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+
+# ---------------------------------------------------------------------------
 # When running from the TensorRT-LLM source tree the local ``tensorrt_llm/``
 # directory shadows the *installed* package (which contains the compiled C++
 # ``bindings`` extension).  We detect this situation and temporarily patch
@@ -42,8 +56,7 @@ if _REPO_ROOT in sys.path:
     # Also remove '' or '.' which Python adds for CWD — it has the same effect
     # when CWD == repo root.
     for _cwd_marker in ("", "."):
-        if _cwd_marker in sys.path and os.path.abspath(
-                _cwd_marker) == _REPO_ROOT:
+        if _cwd_marker in sys.path and os.path.abspath(_cwd_marker) == _REPO_ROOT:
             sys.path.remove(_cwd_marker)
             break
 from typing import Any
@@ -60,7 +73,7 @@ logger = logging.getLogger("qwen3_moe_bench")
 _PRECISION_SM_CONSTRAINTS: dict[str, tuple[str, Any]] = {
     "bf16": ("min", 80),
     "fp8": ("min", 89),
-    "nvfp4": ("min",100),
+    "nvfp4": ("min", 100),
 }
 
 
@@ -134,7 +147,47 @@ def get_supported_precisions(
 # Model loading / cleanup
 # ---------------------------------------------------------------------------
 
-def load_model(model_path: str, enable_nvtx: bool = False):
+
+def get_moe_backend_for_precision(
+    precision: str,
+    sm_version: tuple[int, int],
+) -> str:
+    """Choose the best MoE backend for *precision* on the current GPU.
+
+    The default ``CUTLASS`` backend uses DeepGEMM for FP8 block-scale
+    GEMMs, which only supports SM90 (Hopper).  On SM100 (Blackwell) we
+    fall back to ``TRTLLM`` (``TRTLLMGenFusedMoE``) which handles
+    FP8 block-scale without DeepGEMM.
+
+    Args:
+        precision: ``"bf16"``, ``"fp8"``, or ``"nvfp4"``.
+        sm_version: ``(major, minor)`` tuple from
+            :func:`torch.cuda.get_device_capability`.
+
+    Returns:
+        MoE backend string suitable for ``MoeConfig(backend=...)``.
+    """
+    # sm_num = sm_version[0] * 10 + sm_version[1]
+
+    # FP8 block-scale checkpoints use DeepGEMM inside the CUTLASS backend,
+    # which is SM90-only.  On SM100 (Blackwell), use the TRTLLM backend
+    # (TRTLLMGenFusedMoE) which supports FP8 block-scale natively.
+    # if precision.lower() == "fp8" and sm_num >= 100 and sm_num < 120:
+    #     logger.info(
+    #         "SM%d detected — switching MoE backend from CUTLASS to TRTLLM "
+    #         "for FP8 (DeepGEMM is SM90-only).",
+    #         sm_num,
+    #     )
+        # return "TRTLLM"
+
+    return "CUTLASS"
+
+
+def load_model(
+    model_path: str,
+    enable_nvtx: bool = False,
+    moe_backend: str = "CUTLASS",
+):
     """Load a Qwen3-30B-A3B model via the TRT-LLM high-level ``LLM`` API.
 
     Pre-quantized FP8/nvFP4 checkpoints include ``hf_quant_config.json``
@@ -144,15 +197,18 @@ def load_model(model_path: str, enable_nvtx: bool = False):
         model_path: Path to the HuggingFace-format checkpoint.
         enable_nvtx: If ``True``, passes
             ``enable_layerwise_nvtx_marker=True`` for nsys profiling.
+        moe_backend: MoE backend to use (e.g. ``"CUTLASS"``, ``"TRTLLM"``).
 
     Returns:
         A ``tensorrt_llm.LLM`` instance.
     """
     from tensorrt_llm import LLM
+    from tensorrt_llm.llmapi import MoeConfig
 
     kwargs: dict[str, Any] = {
         "model": model_path,
         "backend": "pytorch",
+        "moe_config": MoeConfig(backend=moe_backend),
     }
     if enable_nvtx:
         kwargs["enable_layerwise_nvtx_marker"] = True
@@ -186,9 +242,18 @@ def detect_moe_backend(llm) -> str:
 def cleanup_model(llm) -> None:
     """Explicitly delete an LLM instance and reclaim GPU memory.
 
+    Calls ``LLM.shutdown()`` first to tear down the executor and release
+    CUDA resources deterministically, then deletes the Python object and
+    forces a full GC + CUDA cache flush.
+
     Args:
         llm: The ``LLM`` object to destroy.
     """
+    # Deterministic shutdown — releases executor threads, CUDA contexts,
+    # and pinned memory that ``del`` alone may not reclaim in time.
+    if hasattr(llm, "shutdown"):
+        llm.shutdown()
+
     del llm
     gc.collect()
     if torch.cuda.is_available():
@@ -199,6 +264,7 @@ def cleanup_model(llm) -> None:
 # ---------------------------------------------------------------------------
 # CLI helpers
 # ---------------------------------------------------------------------------
+
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     """Register shared CLI arguments for all benchmark scripts.
@@ -267,6 +333,7 @@ def get_model_path_for_precision(
 # ---------------------------------------------------------------------------
 # Result serialisation
 # ---------------------------------------------------------------------------
+
 
 def write_result(
     output_dir: str,

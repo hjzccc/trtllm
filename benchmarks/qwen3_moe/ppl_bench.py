@@ -59,6 +59,7 @@ from benchmarks.qwen3_moe.bench_utils import (  # noqa: E402
     add_common_args,
     cleanup_model,
     detect_moe_backend,
+    get_moe_backend_for_precision,
     get_model_path_for_precision,
     get_sm_version,
     get_supported_precisions,
@@ -91,7 +92,7 @@ def _load_wikitext2_tokens(tokenizer, input_len: int, num_chunks: int) -> list[l
     """
     from datasets import load_dataset
 
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split="test")
 
     # Concatenate all non-empty lines into one string
     text = "\n".join(line for line in dataset["text"] if line.strip())
@@ -104,8 +105,7 @@ def _load_wikitext2_tokens(tokenizer, input_len: int, num_chunks: int) -> list[l
     n_chunks = min(num_chunks, total_available)
     if n_chunks < num_chunks:
         logger.warning(
-            "WikiText-2 only provides %d full chunks of %d tokens "
-            "(requested %d). Using %d chunks.",
+            "WikiText-2 only provides %d full chunks of %d tokens (requested %d). Using %d chunks.",
             total_available,
             input_len,
             num_chunks,
@@ -194,10 +194,34 @@ def _evaluate_perplexity(
                 "return_context_logits=True with the PyTorch backend."
             )
 
-        # Logits at position i predict token at position i+1
-        # So we use logits[:-1] to predict tokens[1:]
+        if idx == 0:
+            logger.info(
+                "  context_logits shape: %s (input_len=%d)",
+                list(context_logits.shape),
+                len(token_ids),
+            )
+
+        # context_logits[i] predicts the token at position i+1
+        # (standard causal-LM convention — unshifted).
+        #
+        # TRT-LLM *should* return shape (input_len, V), but context
+        # chunking or KV-cache pressure can cause fewer logits to be
+        # returned (e.g. the first chunk's logits may be discarded).
+        # We handle any returned length L <= input_len by aligning
+        # from the RIGHT: use logits[:-1] to predict the last L-1
+        # target tokens.
         input_ids_tensor = torch.tensor(token_ids, device=context_logits.device)
-        chunk_ppl = _ppl(context_logits[:-1], input_ids_tensor[1:])
+        n_logits = context_logits.shape[0]
+        n_input = len(token_ids)
+        if n_logits > n_input or n_logits < 2:
+            raise RuntimeError(
+                f"Unexpected context_logits length {n_logits} for input length {n_input}."
+            )
+        # logits[:-1] → positions that have a known next-token target.
+        # Targets are the last (n_logits - 1) tokens of the input.
+        pred_logits = context_logits[:-1]  # (n_logits-1, V)
+        target_ids = input_ids_tensor[n_input - n_logits + 1 :]  # (n_logits-1,)
+        chunk_ppl = _ppl(pred_logits, target_ids)
         per_chunk_ppls.append(chunk_ppl)
 
         if (idx + 1) % 10 == 0 or idx == 0:
@@ -211,6 +235,7 @@ def _evaluate_perplexity(
     # Overall perplexity: geometric mean of per-chunk PPLs
     # = exp(mean(log(ppl_i)))
     import math
+
     log_ppls = [math.log(p) for p in per_chunk_ppls]
     overall_ppl = math.exp(sum(log_ppls) / len(log_ppls))
 
@@ -367,19 +392,21 @@ def main() -> None:
         model_path = get_model_path_for_precision(args, precision)
         if model_path is None:
             logger.warning(
-                "No model path for precision '%s' — skipping. "
-                "Use --model_path_%s to provide one.",
+                "No model path for precision '%s' — skipping. Use --model_path_%s to provide one.",
                 precision,
                 precision,
             )
             continue
 
+        moe_backend = get_moe_backend_for_precision(precision, sm_version)
+
         logger.info("=" * 60)
         logger.info("Evaluating perplexity: %s", precision.upper())
         logger.info("Model path: %s", model_path)
+        logger.info("MoE backend: %s", moe_backend)
         logger.info("=" * 60)
 
-        llm = load_model(model_path)
+        llm = load_model(model_path, moe_backend=moe_backend)
 
         moe_backend = detect_moe_backend(llm)
         logger.info("MoE backend: %s", moe_backend)

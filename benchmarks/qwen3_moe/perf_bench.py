@@ -61,6 +61,7 @@ from benchmarks.qwen3_moe.bench_utils import (  # noqa: E402
     add_common_args,
     cleanup_model,
     detect_moe_backend,
+    get_moe_backend_for_precision,
     get_model_path_for_precision,
     get_sm_version,
     get_supported_precisions,
@@ -256,6 +257,7 @@ def _run_nsys_benchmark(
 # Comparison table
 # ---------------------------------------------------------------------------
 
+
 def _print_comparison_table(results: dict[str, dict[str, Any]]) -> None:
     """Print a formatted comparison table of perf results across precisions.
 
@@ -295,6 +297,7 @@ def _print_comparison_table(results: dict[str, dict[str, Any]]) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -399,20 +402,22 @@ def main() -> None:
         model_path = get_model_path_for_precision(args, precision)
         if model_path is None:
             logger.warning(
-                "No model path for precision '%s' — skipping. "
-                "Use --model_path_%s to provide one.",
+                "No model path for precision '%s' — skipping. Use --model_path_%s to provide one.",
                 precision,
                 precision,
             )
             continue
 
+        moe_backend = get_moe_backend_for_precision(precision, sm_version)
+
         logger.info("=" * 60)
         logger.info("Benchmarking precision: %s", precision.upper())
         logger.info("Model path: %s", model_path)
+        logger.info("MoE backend: %s", moe_backend)
         logger.info("=" * 60)
 
         enable_nvtx = args.mode == "nsys"
-        llm = load_model(model_path, enable_nvtx=enable_nvtx)
+        llm = load_model(model_path, enable_nvtx=enable_nvtx, moe_backend=moe_backend)
 
         moe_backend = detect_moe_backend(llm)
         logger.info("MoE backend: %s", moe_backend)
